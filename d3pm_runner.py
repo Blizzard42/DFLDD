@@ -150,7 +150,7 @@ class D3PM(nn.Module):
         alpha_bar = torch.cos((steps + 0.008) / 1.008 * torch.pi / 2)
         self.beta_t = torch.minimum(
             1 - alpha_bar[1:] / alpha_bar[:-1], torch.ones_like(alpha_bar[1:]) * 0.999
-        )
+        ) # Very close to [1 / (n_T - t) for t in range(0, n_T)]
 
         # self.beta_t = [1 / (self.n_T - t + 1) for t in range(1, self.n_T + 1)]
         self.eps = 1e-6
@@ -173,6 +173,7 @@ class D3PM(nn.Module):
         )  # this will be used for q_posterior_logits
 
         q_mat_t = q_onestep_mats[0]
+        # q_mats represents the cumulative transition matrices up to time t
         q_mats = [q_mat_t]
         for idx in range(1, self.n_T):
             q_mat_t = q_mat_t @ q_onestep_mats[idx]
