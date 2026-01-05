@@ -9,3 +9,5 @@ run.sh
 ckpt
 contents/sample*
 runs
+contents/test_masking
+contents/test_uniform
