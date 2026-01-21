@@ -39,7 +39,7 @@ blku = lambda ic, oc: nn.Sequential(
 )
 
 class DummyX0Model(nn.Module):
-    def __init__(self, n_channel: int, N: int = 16) -> None:
+    def __init__(self, n_channel: int, N: int = 16, num_timesteps: int = 1000) -> None:
         super(DummyX0Model, self).__init__()
         self.down1 = blk(n_channel, 16)
         self.down2 = blk(16, 32)
@@ -69,12 +69,28 @@ class DummyX0Model(nn.Module):
         self.temb_3 = nn.Linear(32, 64)
         self.temb_4 = nn.Linear(32, 512)
         self.N = N
+        self.num_timesteps = num_timesteps
 
     def forward(self, x, t, cond) -> torch.Tensor:
+        # Handle Soft Samples from FLDD Warmup (Shape: B, C, H, W, N)
+        # If x has 5 dimensions, it is a soft probability distribution.
+        # We collapse it to a scalar "pixel intensity" using expected value.
+        if x.dim() == 5:
+            # Create indices [0, 1, ..., N-1]
+            indices = torch.arange(x.shape[-1], device=x.device, dtype=x.dtype)
+            # Sum(Probability * Index) -> Weighted Average (Expected Value)
+            x = (x * indices).sum(dim=-1)
+
         # Note: x can be float (soft sample) or int (hard sample)
         # We assume x is roughly in range [0, N-1]
-        x = (2 * x.float() / self.N) - 1.0
-        t = t.float().reshape(-1, 1) / 1000
+        if x.dtype == torch.long or x.dtype == torch.int:
+            x = (2 * x.float() / self.N) - 1.0
+        else:
+            x = (2 * x) - 1.0
+            
+        if x.min() < -1.0 or x.max() > 1.0:
+            print("Warning: x out of range [-1, 1]")
+        t = t.float().reshape(-1, 1) / self.num_timesteps
         t_features = [torch.sin(t * 3.1415 * 2**i) for i in range(16)] + [
             torch.cos(t * 3.1415 * 2**i) for i in range(16)
         ]
@@ -150,7 +166,7 @@ class ForwardProcess(nn.Module, ABC):
         """Returns logits for q(x_{t-1} | x_t, x_0)."""
         pass
 
-    def get_auxiliary_loss(self, x_0, x_t, t):
+    def get_auxiliary_loss(self, x_0, x_t, t, kl_div=None, log_probs=None):
         """Returns 0.0 by default or specific auxiliary losses (e.g. for FLDD)."""
         return 0.0
 
@@ -303,7 +319,7 @@ class FLDD(ForwardProcess):
         self.eps = 1e-6
         
         # Training state
-        self.warmup_steps = 10000
+        self.warmup_steps = 600
         self.tau_start = 1.0
         self.tau_end = 1e-3
         self.current_tau = self.tau_start
@@ -324,26 +340,24 @@ class FLDD(ForwardProcess):
             self.current_tau = self.tau_end
 
     def _get_marginals(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Computes q_phi(z_t | x) using the forward network."""
+        """Computes q_phi(z_t | x) using the forward network. Expects x (B, ...) as indices."""
         if t.dim() == 0:
             t = t.reshape(1)
         
         # The forward net might need dummy conditioning if it's the same class as reverse model
         bs = x.shape[0]
         dummy_cond = torch.zeros(bs, dtype=torch.long, device=x.device)
-        
-        # We handle input shape adaptation if x is soft (K channels) vs hard (1 channel)
-        # Assuming forward_net is the provided DummyX0Model:
-        # If x is hard (B, H, W), expected by DummyX0Model.
-        # If x is soft (B, H, W, K) -> Not applicable here because 'x' passed to this func is 
-        # usually the clean data x_0 which is always discrete indices.
-        return self.forward_net(x, t, dummy_cond)
+        logits = self.forward_net(x, t, dummy_cond)
+        is_t0 = (t == 0).view(-1, *[1]*(x.dim()))
+        logits = torch.where(is_t0, torch.log(F.one_hot(x, num_classes=self.num_classes).float() + self.eps), logits)
+        return logits
 
     def sample(self, x_0, t, noise):
         """
         Samples z_t from q_phi(z_t | x).
         Returns z_t and auxiliary info (log_prob).
         """
+        assert (t > 0).all(), "t must be >= 1"
         logits_t = self._get_marginals(x_0, t)
         
         # Explicit Boundary Conditions 
@@ -409,23 +423,28 @@ class FLDD(ForwardProcess):
         Computes log q(z_s | z_t, x).
         Handles both discrete x_t (REINFORCE) and soft x_t (Warmup/Eq 14).
         """
+        if x_0.dtype == torch.long or x_0.dtype == torch.int:
+            # Case 1: Ground Truth. Convert indices to one-hot distribution.
+            x_0_input = x_0
+            x_0_dist = F.one_hot(x_0, self.num_classes).float()
+        else:
+            # Case 2: Prediction. Convert logits to probability distribution.
+            # We must Softmax here so that _get_marginals receives valid probs
+            # and the t=1 boundary condition gets a valid distribution.
+            x_0_dist = torch.softmax(x_0, dim=-1)
+            x_0_input = x_0_dist
+        
         # 1. Get Marginals u_t and u_s 
-        logits_t = self._get_marginals(x_0, t)
+        logits_t = self._get_marginals(x_0_input, t)
         
         # For s = t-1. If t=1, q(z_0|x) is delta(x). 
         # We simulate this by making u_s very sharp around x_0.
         # However, to be differentiable for phi, we calculate u_s normally for s>0.
         # For t=1, we enforce boundary condition manually later.
-        logits_s = self._get_marginals(x_0, t - 1)
+        logits_s = self._get_marginals(x_0_input, t - 1)
         
         u_t = torch.softmax(logits_t, dim=-1)
         u_s = torch.softmax(logits_s, dim=-1)
-
-        # Boundary condition: if t=1, u_s should be delta(x_0) 
-        # x_0 is indices.
-        x_0_onehot = F.one_hot(x_0, self.num_classes).float()
-        is_t1 = (t == 1).view(-1, *[1]*(x_t.dim()-1 if x_t.dim() > 1 else 0), 1)
-        u_s = torch.where(is_t1, x_0_onehot, u_s)
 
         # 2. Compute Full Coupling Matrix Q (z_s | z_t)
         Q = self._compute_coupling(u_s, u_t) # (B, ..., K_from, K_to)
@@ -459,7 +478,7 @@ class FLDD(ForwardProcess):
 
         return torch.log(posterior_dist + self.eps)
 
-    def get_auxiliary_loss(self, x_0, x_t, t, kl_div):
+    def get_auxiliary_loss(self, x_0, x_t, t, kl_div=None, log_probs=None):
         """
         Computes gradients for phi.
         Warmup: Standard backprop through soft samples (handled by autograd).
@@ -471,13 +490,33 @@ class FLDD(ForwardProcess):
             # The "Magic Box" trick (prob / prob.detach()) * cost handles both:
             # Differentiate E_q[C] -> grad_q * C + q * grad_C.
             
-            # We need the log_prob of z_t that was sampled earlier.
-            # It was returned by sample(). 
-            # Note: The calling loop must pass the log_prob here. 
-            # We'll assume 'x_t' passed here is just the sample, we need log_prob passed explicitly?
-            # Architecture choice: we'll handle this in DiscreteDiffusion.forward 
-            # to keep this method signature simple or rely on the return value of sample().
-            return 0.0 # Handled in loop
+            if log_probs is None or kl_div is None:
+                return 0.0
+
+            # Aggregate log_prob and KL to match shapes (sum over spatial dims)
+            # z_t_log_prob is (B, H, W), kl_per_element is (B*H*W)
+            # We assume x_0 corresponds to 'x' from forward call, used for shape inference if needed
+            
+            flat_log_prob = log_probs.flatten(start_dim=1).sum(dim=1) # (B,)
+            
+            # For variance reduction, we treat each pixel/dimension? 
+            # Standard REINFORCE usually sums rewards per sample.
+            # KL per sample:
+            kl_per_sample = kl_div.view(x_0.shape[0], -1).sum(dim=1) # (B,)
+            
+            # Update baseline
+            with torch.no_grad():
+                self.moving_avg_baseline = (
+                    self.baseline_decay * self.moving_avg_baseline + 
+                    (1 - self.baseline_decay) * kl_per_sample.mean()
+                )
+                baseline = self.moving_avg_baseline
+
+            # REINFORCE Gradient Estimator
+            reinforce_loss = (flat_log_prob * (kl_per_sample.detach() - baseline)).mean()
+            
+            return reinforce_loss
+            
         return 0.0
 
 # --- Training Loop & Model Wrapper ---
@@ -546,36 +585,10 @@ class DiscreteDiffusion(nn.Module):
         vb_loss = kl_per_element.mean()
         
         # 5. Auxiliary / REINFORCE Loss 
-        aux_loss = 0.0
-        if isinstance(self.forward_process, FLDD) and self.forward_process.use_reinforce:
-            # Eq 13: E [ grad( log q(z_t|x) * KL ) ]
-            # Implementation: (log_prob / log_prob.detach()) * KL.detach() + KL
-            # The second +KL ensures grad flows through the 'true_q' parameters in the KL term
-            
-            # Aggregate log_prob and KL to match shapes (sum over spatial dims)
-            # z_t_log_prob is (B, H, W), kl_per_element is (B*H*W)
-            flat_log_prob = z_t_log_prob.flatten(start_dim=1).sum(dim=1) # (B,)
-            
-            # For variance reduction, we treat each pixel/dimension? 
-            # Standard REINFORCE usually sums rewards per sample.
-            # KL per sample:
-            kl_per_sample = kl_per_element.view(x.shape[0], -1).sum(dim=1) # (B,)
-            
-            # Update baseline
-            with torch.no_grad():
-                self.forward_process.moving_avg_baseline = (
-                    self.forward_process.baseline_decay * self.forward_process.moving_avg_baseline + 
-                    (1 - self.forward_process.baseline_decay) * kl_per_sample.mean()
-                )
-                baseline = self.forward_process.moving_avg_baseline
-
-            # REINFORCE Gradient Estimator
-            reinforce_loss = (flat_log_prob * (kl_per_sample.detach() - baseline)).mean()
-            
-            # Standard path for gradients through phi inside the KL term itself
-            # (Calculated by vb_loss since true_q depends on phi)
-            
-            aux_loss = reinforce_loss
+        # Calculate auxiliary loss directly via the forward process
+        aux_loss = self.forward_process.get_auxiliary_loss(
+            x, x_t, t, kl_div=kl_per_element, log_probs=z_t_log_prob
+        )
 
         # Reconstruction Loss (Cross Entropy)
         predicted_x0_logits = predicted_x0_logits.flatten(start_dim=0, end_dim=-2)
@@ -633,10 +646,12 @@ class DiscreteDiffusion(nn.Module):
 
 if __name__ == "__main__":
     N = 2  # number of classes per pixel
-    T = 1000
+    T = 25
+
+    EXP_DIR = "runs/fldd_test_small_T"
     
     # Example 1: Uniform (Equivalent to original D3PM)
-    forward_proc = Uniform(num_classes=N, num_timesteps=T)
+    # forward_proc = Uniform(num_classes=N, num_timesteps=T)
     
     # Example 2: Masking
     # forward_proc = Masking(num_classes=N, num_timesteps=T)
@@ -645,8 +660,8 @@ if __name__ == "__main__":
     # We need a separate network for FLDD. We reuse DummyX0Model structure.
     # Note: DummyX0Model outputs (N * n_channel) channels. 
     # For FLDD marginals q(z_t|x), we need output size N.
-    # fldd_net = DummyX0Model(n_channel=1, N=N)
-    # forward_proc = FLDD(num_classes=N, num_timesteps=T, forward_net=fldd_net)
+    fldd_net = DummyX0Model(n_channel=1, N=N, num_timesteps=T)
+    forward_proc = FLDD(num_classes=N, num_timesteps=T, forward_net=fldd_net)
 
     # Initialize Model
     # Note: If using Masking, num_classes for x0_model should be N+1 potentially?
@@ -657,7 +672,7 @@ if __name__ == "__main__":
     # but the provided DummyX0Model takes `n_channel` (input image channels, usually 1 for MNIST)
     # and `N` (quantization levels).
     
-    x0_model = DummyX0Model(n_channel=1, N=N)
+    x0_model = DummyX0Model(n_channel=1, N=N, num_timesteps=T)
     
     model = DiscreteDiffusion(
         x0_model=x0_model,
@@ -718,7 +733,7 @@ if __name__ == "__main__":
                 loss_ema = 0.99 * loss_ema + 0.01 * loss.item()
             
             pbar.set_description(
-                f"loss: {loss_ema:.4f}, norm: {norm:.4f}, vb: {info['vb_loss']:.4f}, ce: {info['ce_loss']:.4f}"
+                f"loss: {loss_ema:.4f}, norm: {norm:.4f}, vb: {info['vb_loss']:.4f}, ce: {info['ce_loss']:.4f}, aux: {info['aux_loss']:.4f}"
             )
             optim.step()
             global_step += 1
@@ -733,7 +748,7 @@ if __name__ == "__main__":
                     init_noise = torch.randint(0, init_dim, (4, 1, 32, 32)).cuda()
 
                     images = model.sample_with_image_sequence(
-                        init_noise, cond_sample, stride=40
+                        init_noise, cond_sample, stride=1
                     )
                     
                     # image sequences to gif
@@ -748,15 +763,15 @@ if __name__ == "__main__":
 
                     # Ensure directory exists or handle path
                     import os
-                    os.makedirs("contents/test_uniform_post_fldd", exist_ok=True)
+                    os.makedirs(f"{EXP_DIR}/results", exist_ok=True)
                     
                     gif[0].save(
-                        f"contents/test_uniform_post_fldd/sample_{global_step}.gif",
+                        f"{EXP_DIR}/results/sample_{global_step}.gif",
                         save_all=True,
                         append_images=gif[1:],
                         duration=100,
                         loop=0,
                     )
-                    gif[-1].save(f"contents/test_uniform_post_fldd/sample_{global_step}_last.png")
+                    gif[-1].save(f"{EXP_DIR}/results/sample_{global_step}_last.png")
 
                 model.train()
