@@ -449,6 +449,7 @@ class FLDD(ForwardProcess):
         term2 = prob_move_source.unsqueeze(-1) * m_st.unsqueeze(-2) # (B, ..., K_from, K_to)
         
         Q = term1 + term2
+        Q = Q / (Q.sum(dim=-1, keepdim=True) + self.eps)
         return Q
 
     def compute_posterior_logits(self, x_0, x_t, t):
