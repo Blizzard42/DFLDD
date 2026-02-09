@@ -360,8 +360,33 @@ class DiT_Llama(nn.Module):
     def forward(self, x, t, y):
         self.freqs_cis = self.freqs_cis.to(x.device)
 
-        x_onehot = torch.nn.functional.one_hot(x, self.N).float().to(x.device)
-        x = (2 * x.float() / (self.N - 1)) - 1.0
+        # --- FLDD COMPATIBILITY MODIFICATION ---
+        # Handle Soft Samples from FLDD Warmup (Shape: B, C, H, W, N)
+        if x.dim() > 5 or x.dim() < 4:
+            raise ValueError(f"Unsupported input shape {x.shape}. Expected 4 or 5 dimensions -- must add compatablity to DiT_Llama for this shape.")
+        elif x.dim() == 5:
+            # x is a soft probability distribution
+            # 1. Save the soft probabilities for the residual connection later
+            x_onehot = x 
+            
+            # 2. Collapse to scalar "pixel intensity" using expected value for the Transformer input
+            indices = torch.arange(x.shape[-1], device=x.device, dtype=x.dtype)
+            # Sum(Probability * Index) -> Weighted Average
+            x_scalar = (x * indices).sum(dim=-1)
+            
+            # 3. Normalize Expected Value to [-1, 1]
+            # range is roughly [0, N-1] -> [-1, 1]
+            x = (2 * x_scalar / (self.N - 1)) - 1.0
+            
+        else:
+            # x is discrete indices (Hard Samples / REINFORCE)
+            # 1. Create one-hot for residual connection
+            x_onehot = torch.nn.functional.one_hot(x, self.N).float().to(x.device)
+            
+            # 2. Normalize Indices to [-1, 1]
+            x = (2 * x.float() / (self.N - 1)) - 1.0
+        # --- End FLDD COMPATIBILITY MODIFICATION ---
+
         x = self.init_conv_seq(x)
 
         x = self.patchify(x)

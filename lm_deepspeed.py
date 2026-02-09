@@ -17,7 +17,7 @@ from transformers import default_data_collator, get_scheduler
 
 import wandb
 from d3pm_runner import D3PM
-from dit import DDiT_Llama
+from src.dit import DDiT_Llama
 
 
 class WikiTextDataset(Dataset):
